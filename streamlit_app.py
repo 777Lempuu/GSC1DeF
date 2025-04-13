@@ -8,7 +8,7 @@ import io
 import soundfile as sf
 import gdown
 import os
-import matplotlib.pyplot as plt  # Added missing import
+import matplotlib.pyplot as plt
 
 # Configuration
 MODEL_URL = "https://drive.google.com/uc?id=1Zvm-s-E4MbqCdeCCjG-6ggOaWzDJw-Jf"
@@ -40,19 +40,16 @@ class DeFixMatchModel(torch.nn.Module):
 
 @st.cache_resource
 def load_model():
-    # Download model from Google Drive if not exists
     if not os.path.exists(MODEL_PATH):
         with st.spinner('Downloading model from Google Drive...'):
             gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
     
-    # Initialize and load model
     model = DeFixMatchModel(num_classes=len(CLASSES))
     model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
     model.eval()
     return model
 
 def transform_audio(waveform, sample_rate):
-    """Convert waveform to mel spectrogram with same params as training"""
     transform = T.MelSpectrogram(
         sample_rate=16000,
         n_mels=64,
@@ -61,18 +58,16 @@ def transform_audio(waveform, sample_rate):
     )
     spectrogram = transform(waveform)
     
-    # Pad or trim to expected size (adjust based on your training)
-    target_length = 101  # Typical for 1s audio at hop_length=160
+    target_length = 101
     if spectrogram.shape[-1] < target_length:
         pad_amount = target_length - spectrogram.shape[-1]
         spectrogram = torch.nn.functional.pad(spectrogram, (0, pad_amount))
     elif spectrogram.shape[-1] > target_length:
         spectrogram = spectrogram[:, :, :target_length]
     
-    return spectrogram.unsqueeze(0)  # Add batch dimension
+    return spectrogram
 
 def plot_waveform(waveform, sample_rate):
-    """Display waveform plot"""
     plt.figure(figsize=(10, 3))
     plt.plot(waveform.numpy().T)
     plt.title("Waveform")
@@ -81,18 +76,20 @@ def plot_waveform(waveform, sample_rate):
     st.pyplot(plt)
 
 def plot_spectrogram(spec, title="Mel Spectrogram"):
-    """Display spectrogram plot"""
+    # Fix: Squeeze out the channel dimension and transpose
+    spec_to_plot = spec.squeeze(0).numpy()  # Now shape (64, 101)
     plt.figure(figsize=(10, 4))
-    im = plt.imshow(spec.log2()[0,:,:].numpy(), cmap='viridis', aspect='auto')
+    plt.imshow(spec_to_plot, cmap='viridis', aspect='auto', origin='lower')
     plt.title(title)
-    plt.colorbar(im, format="%+2.0f dB")
+    plt.colorbar(format="%+2.0f dB")
+    plt.ylabel("Mel Bin")
+    plt.xlabel("Time Frame")
     st.pyplot(plt)
 
 # Streamlit UI
 st.title("🎤 Speech Command Recognition")
 st.write("Upload a 1-second audio clip to classify the speech command")
 
-# Load model (cached after first load)
 try:
     model = load_model()
     st.success("Model loaded successfully!")
@@ -107,10 +104,8 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
     try:
-        # Read audio file
         audio_bytes = uploaded_file.read()
         
-        # Convert to numpy array with better error handling
         with io.BytesIO(audio_bytes) as f:
             try:
                 data, sample_rate = sf.read(f)
@@ -119,31 +114,25 @@ if uploaded_file is not None:
                 st.error("Supported formats: WAV, MP3, FLAC, OGG")
                 st.stop()
         
-        # Convert to mono if needed
         if len(data.shape) > 1:
             data = data.mean(axis=1)
             
-        # Validate duration
         duration = len(data)/sample_rate
-        if not (0.8 <= duration <= 1.5):  # Allow slight variation
+        if not (0.8 <= duration <= 1.5):
             st.warning(f"For best results, use 1-second audio. Current: {duration:.2f}s")
         
-        # Trim if too long
         if duration > 1.0:
             data = data[:int(sample_rate*1)]
             st.info(f"Trimmed audio to first 1 second (original: {duration:.2f}s)")
             
-        # Convert to tensor
         waveform = torch.from_numpy(data).float().unsqueeze(0)
         
-        # Resample to 16kHz if needed
         if sample_rate != 16000:
             resampler = T.Resample(sample_rate, 16000)
             waveform = resampler(waveform)
             sample_rate = 16000
             st.info(f"Resampled audio to 16kHz (original: {sample_rate}Hz)")
             
-        # Visualizations
         col1, col2 = st.columns(2)
         with col1:
             st.audio(audio_bytes, format='audio/wav')
@@ -151,19 +140,16 @@ if uploaded_file is not None:
             st.write(f"Duration: {len(data)/sample_rate:.2f}s")
             st.write(f"Sample Rate: {sample_rate}Hz")
         
-        # Show plots
         plot_waveform(waveform, sample_rate)
         spectrogram = transform_audio(waveform, sample_rate)
         plot_spectrogram(spectrogram)
         
-        # Classify
         with st.spinner('Classifying...'):
             with torch.no_grad():
-                output = model(spectrogram)
+                output = model(spectrogram.unsqueeze(0))  # Add batch dimension
                 probabilities = torch.nn.functional.softmax(output[0], dim=0)
                 top_prob, top_idx = torch.topk(probabilities, 5)
                 
-        # Display results
         st.subheader("🔍 Prediction Results")
         for i in range(5):
             st.progress(float(top_prob[i]), text=f"{CLASSES[top_idx[i]]}: {top_prob[i]*100:.2f}%")
