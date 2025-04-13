@@ -8,6 +8,7 @@ import io
 import soundfile as sf
 import gdown
 import os
+import matplotlib.pyplot as plt  # Added missing import
 
 # Configuration
 MODEL_URL = "https://drive.google.com/uc?id=1Zvm-s-E4MbqCdeCCjG-6ggOaWzDJw-Jf"
@@ -72,20 +73,20 @@ def transform_audio(waveform, sample_rate):
 
 def plot_waveform(waveform, sample_rate):
     """Display waveform plot"""
-    fig, ax = plt.subplots(figsize=(10, 3))
-    ax.plot(waveform.numpy().T)
-    ax.set_title("Waveform")
-    ax.set_xlabel("Sample")
-    ax.set_ylabel("Amplitude")
-    st.pyplot(fig)
+    plt.figure(figsize=(10, 3))
+    plt.plot(waveform.numpy().T)
+    plt.title("Waveform")
+    plt.xlabel("Sample")
+    plt.ylabel("Amplitude")
+    st.pyplot(plt)
 
 def plot_spectrogram(spec, title="Mel Spectrogram"):
     """Display spectrogram plot"""
-    fig, ax = plt.subplots(figsize=(10, 4))
-    im = ax.imshow(spec.log2()[0,:,:].numpy(), cmap='viridis', aspect='auto')
-    ax.set_title(title)
-    fig.colorbar(im, ax=ax, format="%+2.0f dB")
-    st.pyplot(fig)
+    plt.figure(figsize=(10, 4))
+    im = plt.imshow(spec.log2()[0,:,:].numpy(), cmap='viridis', aspect='auto')
+    plt.title(title)
+    plt.colorbar(im, format="%+2.0f dB")
+    st.pyplot(plt)
 
 # Streamlit UI
 st.title("🎤 Speech Command Recognition")
@@ -109,13 +110,28 @@ if uploaded_file is not None:
         # Read audio file
         audio_bytes = uploaded_file.read()
         
-        # Convert to numpy array
+        # Convert to numpy array with better error handling
         with io.BytesIO(audio_bytes) as f:
-            data, sample_rate = sf.read(f)
+            try:
+                data, sample_rate = sf.read(f)
+            except Exception as e:
+                st.error(f"Could not read audio file: {str(e)}")
+                st.error("Supported formats: WAV, MP3, FLAC, OGG")
+                st.stop()
         
         # Convert to mono if needed
         if len(data.shape) > 1:
             data = data.mean(axis=1)
+            
+        # Validate duration
+        duration = len(data)/sample_rate
+        if not (0.8 <= duration <= 1.5):  # Allow slight variation
+            st.warning(f"For best results, use 1-second audio. Current: {duration:.2f}s")
+        
+        # Trim if too long
+        if duration > 1.0:
+            data = data[:int(sample_rate*1)]
+            st.info(f"Trimmed audio to first 1 second (original: {duration:.2f}s)")
             
         # Convert to tensor
         waveform = torch.from_numpy(data).float().unsqueeze(0)
@@ -125,6 +141,7 @@ if uploaded_file is not None:
             resampler = T.Resample(sample_rate, 16000)
             waveform = resampler(waveform)
             sample_rate = 16000
+            st.info(f"Resampled audio to 16kHz (original: {sample_rate}Hz)")
             
         # Visualizations
         col1, col2 = st.columns(2)
