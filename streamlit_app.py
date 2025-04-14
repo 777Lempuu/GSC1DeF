@@ -1,40 +1,49 @@
 import streamlit as st
 import torch
 import torchaudio
-import torchaudio.transforms as T
-import numpy as np
-from PIL import Image
-import io
-import soundfile as sf
 import gdown
 import os
+import numpy as np
 import matplotlib.pyplot as plt
+from torchaudio.transforms import Resample, MFCC
+import soundfile as sf
+import io
 
 # Configuration
-MODEL_URL = "https://drive.google.com/uc?id=1Zvm-s-E4MbqCdeCCjG-6ggOaWzDJw-Jf"
-MODEL_PATH = "GSC_DeFix.pt"
-CLASSES = [
-    'backward', 'bed', 'bird', 'cat', 'dog', 'down', 'eight', 'five', 'follow', 
-    'forward', 'four', 'go', 'happy', 'house', 'learn', 'left', 'marvin', 'nine', 
-    'no', 'off', 'on', 'one', 'right', 'seven', 'sheila', 'six', 'stop', 'three', 
-    'tree', 'two', 'up', 'visual', 'wow', 'yes', 'zero'
-]
+SAMPLE_RATE = 16000
+N_MFCC = 40
+N_FFT = 400
+HOP_LENGTH = 160
+MODEL_URL = "https://drive.google.com/uc?id=1FdVrAZqoQ2Xz0GBEzDWTnexqWoX-oh6j"
+MODEL_PATH = "best_model_safestudent.pt"
+SUPPORTED_FORMATS = ['wav', 'mp3', 'flac', 'ogg', 'aac', 'm4a']
 
-# Initialize model
-class DeFixMatchModel(torch.nn.Module):
+class AudioCNN(torch.nn.Module):
     def __init__(self, num_classes):
-        super(DeFixMatchModel, self).__init__()
+        super(AudioCNN, self).__init__()
         self.conv1 = torch.nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
+        self.bn1 = torch.nn.BatchNorm2d(32)
         self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.fc1 = torch.nn.Linear(64 * 8 * 8, 128)
-        self.fc2 = torch.nn.Linear(128, num_classes)
-    
+        self.bn2 = torch.nn.BatchNorm2d(64)
+        self.conv3 = torch.nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.bn3 = torch.nn.BatchNorm2d(128)
+        self.pool = torch.nn.MaxPool2d(2, 2)
+        self.dropout = torch.nn.Dropout(0.3)
+        self.fc1 = torch.nn.Linear(128 * 5 * 5, 512)
+        self.fc2 = torch.nn.Linear(512, num_classes)
+        self.fc_input_size = None
+
     def forward(self, x):
-        x = torch.nn.functional.relu(self.conv1(x))
-        x = torch.nn.functional.relu(self.conv2(x))
-        x = torch.nn.functional.adaptive_avg_pool2d(x, (8, 8))
-        x = torch.flatten(x, start_dim=1)
-        x = torch.nn.functional.relu(self.fc1(x))
+        x = self.pool(torch.nn.functional.relu(self.bn1(self.conv1(x))))
+        x = self.pool(torch.nn.functional.relu(self.bn2(self.conv2(x))))
+        x = self.pool(torch.nn.functional.relu(self.bn3(self.conv3(x))))
+        
+        if self.fc_input_size is None:
+            self.fc_input_size = x.shape[1] * x.shape[2] * x.shape[3]
+            self.fc1 = torch.nn.Linear(self.fc_input_size, 512).to(x.device)
+        
+        x = x.view(x.size(0), -1)
+        x = self.dropout(torch.nn.functional.relu(self.fc1(x)))
         x = self.fc2(x)
         return x
 
@@ -44,116 +53,146 @@ def load_model():
         with st.spinner('Downloading model from Google Drive...'):
             gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
     
-    model = DeFixMatchModel(num_classes=len(CLASSES))
-    model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
+    checkpoint = torch.load(MODEL_PATH, map_location='cpu')
+    model = AudioCNN(num_classes=len(get_labels()))
+    model.load_state_dict(checkpoint['teacher_state_dict'])
     model.eval()
     return model
 
-def transform_audio(waveform, sample_rate):
-    transform = T.MelSpectrogram(
-        sample_rate=16000,
-        n_mels=64,
-        n_fft=400,
-        hop_length=160,
+@st.cache_data
+def get_labels():
+    return [
+        'backward', 'bed', 'bird', 'cat', 'dog', 'down', 'eight', 'five', 'follow',
+        'forward', 'four', 'go', 'happy', 'house', 'learn', 'left', 'marvin', 'nine',
+        'no', 'off', 'on', 'one', 'right', 'seven', 'sheila', 'six', 'stop', 'three',
+        'tree', 'two', 'up', 'visual', 'wow', 'yes', 'zero'
+    ]
+
+def load_audio_file(uploaded_file):
+    try:
+        # Read audio file using soundfile (supports more formats)
+        audio_bytes = uploaded_file.read()
+        with io.BytesIO(audio_bytes) as f:
+            data, sample_rate = sf.read(f)
+        
+        # Convert to mono if stereo
+        if len(data.shape) > 1:
+            data = data.mean(axis=1)
+            
+        return torch.from_numpy(data).float().unsqueeze(0), sample_rate
+    except Exception as e:
+        st.error(f"Error loading audio file: {str(e)}")
+        return None, None
+
+def preprocess_audio(waveform, sample_rate):
+    # Resample if needed
+    if sample_rate != SAMPLE_RATE:
+        resampler = Resample(orig_freq=sample_rate, new_freq=SAMPLE_RATE)
+        waveform = resampler(waveform)
+    
+    # Pad/trim to 1 second (16000 samples)
+    if waveform.shape[1] < SAMPLE_RATE:
+        waveform = torch.nn.functional.pad(waveform, (0, SAMPLE_RATE - waveform.shape[1]))
+    elif waveform.shape[1] > SAMPLE_RATE:
+        waveform = waveform[:, :SAMPLE_RATE]
+    
+    # Extract MFCC features
+    mfcc_transform = MFCC(
+        sample_rate=SAMPLE_RATE,
+        n_mfcc=N_MFCC,
+        melkwargs={
+            'n_fft': N_FFT,
+            'hop_length': HOP_LENGTH,
+            'n_mels': 80,
+            'center': False
+        }
     )
-    spectrogram = transform(waveform)
+    mfcc = mfcc_transform(waveform)
     
-    target_length = 101
-    if spectrogram.shape[-1] < target_length:
-        pad_amount = target_length - spectrogram.shape[-1]
-        spectrogram = torch.nn.functional.pad(spectrogram, (0, pad_amount))
-    elif spectrogram.shape[-1] > target_length:
-        spectrogram = spectrogram[:, :, :target_length]
+    if torch.isnan(mfcc).any() or torch.isinf(mfcc).any():
+        mfcc = torch.nan_to_num(mfcc, nan=0.0, posinf=1.0, neginf=-1.0)
     
-    return spectrogram
+    return mfcc
 
 def plot_waveform(waveform, sample_rate):
     plt.figure(figsize=(10, 3))
     plt.plot(waveform.numpy().T)
-    plt.title("Waveform")
+    plt.title("Audio Waveform")
     plt.xlabel("Sample")
     plt.ylabel("Amplitude")
     st.pyplot(plt)
 
-def plot_spectrogram(spec, title="Mel Spectrogram"):
-    # Fix: Squeeze out the channel dimension and transpose
-    spec_to_plot = spec.squeeze(0).numpy()  # Now shape (64, 101)
-    plt.figure(figsize=(10, 4))
-    plt.imshow(spec_to_plot, cmap='viridis', aspect='auto', origin='lower')
-    plt.title(title)
-    plt.colorbar(format="%+2.0f dB")
-    plt.ylabel("Mel Bin")
-    plt.xlabel("Time Frame")
-    st.pyplot(plt)
+def plot_top_predictions(probs, labels):
+    top5_probs, top5_idxs = torch.topk(probs, 5)
+    top5_labels = [labels[i] for i in top5_idxs[0].tolist()]
+    top5_confidences = top5_probs[0].tolist()
+    
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.barh(top5_labels[::-1], top5_confidences[::-1])
+    ax.set_xlabel('Confidence')
+    ax.set_title('Top 5 Predictions')
+    ax.set_xlim(0, 1)
+    plt.tight_layout()
+    return fig
 
 # Streamlit UI
-st.title("🎤 Speech Command Recognition")
-st.write("Upload a 1-second audio clip to classify the speech command")
-
-try:
-    model = load_model()
-    st.success("Model loaded successfully!")
-except Exception as e:
-    st.error(f"Failed to load model: {str(e)}")
-    st.stop()
+st.title("🎤 Speech Command Recognition with SafeStudent")
+st.write("Upload an audio file (MP3, WAV, FLAC, etc.) to classify the speech command")
 
 uploaded_file = st.file_uploader(
-    "Choose an audio file (WAV, MP3, FLAC...)",
-    type=["wav", "mp3", "flac", "ogg"]
+    "Choose an audio file", 
+    type=SUPPORTED_FORMATS,
+    accept_multiple_files=False
 )
 
-if uploaded_file is not None:
+if uploaded_file:
     try:
-        audio_bytes = uploaded_file.read()
+        # Display audio player
+        st.audio(uploaded_file, format=f'audio/{uploaded_file.name.split(".")[-1]}')
         
-        with io.BytesIO(audio_bytes) as f:
-            try:
-                data, sample_rate = sf.read(f)
-            except Exception as e:
-                st.error(f"Could not read audio file: {str(e)}")
-                st.error("Supported formats: WAV, MP3, FLAC, OGG")
-                st.stop()
-        
-        if len(data.shape) > 1:
-            data = data.mean(axis=1)
+        # Load and process audio
+        waveform, sample_rate = load_audio_file(uploaded_file)
+        if waveform is None:
+            st.stop()
             
-        duration = len(data)/sample_rate
+        duration = waveform.shape[1] / sample_rate
         if not (0.8 <= duration <= 1.5):
             st.warning(f"For best results, use 1-second audio. Current: {duration:.2f}s")
         
-        if duration > 1.0:
-            data = data[:int(sample_rate*1)]
-            st.info(f"Trimmed audio to first 1 second (original: {duration:.2f}s)")
-            
-        waveform = torch.from_numpy(data).float().unsqueeze(0)
-        
-        if sample_rate != 16000:
-            resampler = T.Resample(sample_rate, 16000)
-            waveform = resampler(waveform)
-            sample_rate = 16000
-            st.info(f"Resampled audio to 16kHz (original: {sample_rate}Hz)")
-            
+        # Show audio info
         col1, col2 = st.columns(2)
         with col1:
-            st.audio(audio_bytes, format='audio/wav')
+            st.write(f"Duration: {duration:.2f} seconds")
         with col2:
-            st.write(f"Duration: {len(data)/sample_rate:.2f}s")
-            st.write(f"Sample Rate: {sample_rate}Hz")
+            st.write(f"Sample rate: {sample_rate} Hz")
         
+        # Visualize waveform
         plot_waveform(waveform, sample_rate)
-        spectrogram = transform_audio(waveform, sample_rate)
-        plot_spectrogram(spectrogram)
         
-        with st.spinner('Classifying...'):
-            with torch.no_grad():
-                output = model(spectrogram.unsqueeze(0))  # Add batch dimension
-                probabilities = torch.nn.functional.softmax(output[0], dim=0)
-                top_prob, top_idx = torch.topk(probabilities, 5)
-                
-        st.subheader("🔍 Prediction Results")
-        for i in range(5):
-            st.progress(float(top_prob[i]), text=f"{CLASSES[top_idx[i]]}: {top_prob[i]*100:.2f}%")
+        # Preprocess and predict
+        with st.spinner('Processing audio...'):
+            features = preprocess_audio(waveform, sample_rate)
             
+            model = load_model()
+            labels = get_labels()
+            
+            with torch.no_grad():
+                logits = model(features.unsqueeze(0))
+                probs = torch.softmax(logits, dim=1)
+                top_prob, top_idx = torch.max(probs, dim=1)
+        
+        # Display results
+        st.success(f"Predicted command: **{labels[top_idx]}** (confidence: {top_prob.item()*100:.1f}%)")
+        
+        # Show top predictions
+        fig = plot_top_predictions(probs, labels)
+        st.pyplot(fig)
+        
+        # Show detailed probabilities
+        with st.expander("Show all predictions"):
+            for i, (label, prob) in enumerate(zip(labels, probs[0].tolist())):
+                st.write(f"{label}: {prob*100:.2f}%")
+                
     except Exception as e:
         st.error(f"Error processing audio: {str(e)}")
-        st.error("Please ensure you've uploaded a valid audio file (1 second duration works best)")
+        st.error("Please ensure you've uploaded a valid audio file")
