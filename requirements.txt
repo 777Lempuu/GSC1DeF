@@ -6,4 +6,4 @@ soundfile
 gdown
 matplotlib
 Pillow
-librosa
+
